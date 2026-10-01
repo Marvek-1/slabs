@@ -1,0 +1,6 @@
+{
+  "name": "Liquidation Vacuum Engine & Stress-Test Console",
+  "description": "Institutional-grade Liquidation Vacuum Engine (The Architect) and Stress-Testing Simulator (The Strategist) featuring real-time L2 orderbook physics, Cascade Vulnerability Index (CVI), exhaustion floor pricing, 90s snapback state machine, and the 3 failure-mode hammers with Gemini quantitative intelligence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

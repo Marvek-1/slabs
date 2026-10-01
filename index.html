@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function() {
+        // Immediate cross-origin iframe security trap
+        function isCrossOriginError(err) {
+          if (!err) return false;
+          var msg = (typeof err === 'string') ? err : (err.message || err.toString() || '');
+          return msg.indexOf('Blocked a frame with origin') !== -1 ||
+                 msg.indexOf('cross-origin frame') !== -1 ||
+                 (msg.indexOf('Location') !== -1 && msg.indexOf('origin') !== -1);
+        }
+
+        // Global onerror hook
+        var prevOnError = window.onerror;
+        window.onerror = function(msg, url, lineNo, columnNo, error) {
+          if (isCrossOriginError(msg) || isCrossOriginError(error)) {
+            return true; // suppresses error
+          }
+          if (typeof prevOnError === 'function') {
+            return prevOnError.apply(this, arguments);
+          }
+          return false;
+        };
+
+        window.addEventListener('error', function(e) {
+          if (isCrossOriginError(e.error || e.message)) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            return true;
+          }
+        }, true);
+
+        window.addEventListener('unhandledrejection', function(e) {
+          if (isCrossOriginError(e.reason)) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            return true;
+          }
+        }, true);
+
+        // Safe location origin fallback
+        try {
+          if (!window.location.origin) {
+            window.location.origin = window.location.protocol + '//' + window.location.host;
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <title>Liquidation Vacuum Engine &amp; Stress-Test Console</title>
+    <meta name="description" content="Institutional-grade Liquidation Vacuum Engine (The Architect) and Stress-Testing Simulator (The Strategist) featuring real-time L2 orderbook physics, Cascade Vulnerability Index (CVI), exhaustion floor pricing, 90s snapback state machine, and the 3 failure-mode hammers with Gemini quantitative intelligence." />
+    <meta property="og:title" content="Liquidation Vacuum Engine &amp; Stress-Test Console" />
+    <meta property="og:description" content="Institutional-grade Liquidation Vacuum Engine (The Architect) and Stress-Testing Simulator (The Strategist) featuring real-time L2 orderbook physics, Cascade Vulnerability Index (CVI), exhaustion floor pricing, 90s snapback state machine, and the 3 failure-mode hammers with Gemini quantitative intelligence." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
