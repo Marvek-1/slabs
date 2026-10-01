@@ -112,21 +112,24 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           </div>
 
-          {/* Pair Selector */}
-          <div className="flex items-center ml-2 sm:ml-4 bg-zinc-900/80 border border-zinc-800 rounded-lg p-0.5 text-xs font-mono">
-            {['BTC/USDT', 'ETH/USDT', 'SOL/USDT'].map((pair) => (
-              <button
-                key={pair}
-                onClick={() => onPairChange(pair)}
-                className={`px-2.5 py-1 rounded transition-colors ${
-                  currentPair === pair
-                    ? 'bg-zinc-800 text-cyan-300 font-semibold shadow-sm'
-                    : 'text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                {pair.split('/')[0]}
-              </button>
-            ))}
+          {/* Pair Selector Dropdown / Pills */}
+          <div className="flex items-center ml-2 sm:ml-3 bg-zinc-900/90 border border-zinc-800 rounded-lg p-1 text-xs font-mono">
+            <select
+              value={currentPair}
+              onChange={(e) => onPairChange(e.target.value)}
+              className="bg-zinc-900 text-cyan-300 font-bold px-2 py-1 rounded cursor-pointer outline-none border-0 focus:ring-1 focus:ring-cyan-500/50"
+            >
+              <option value="BTC/USDT">BTC/USDT (Bitcoin)</option>
+              <option value="ETH/USDT">ETH/USDT (Ethereum)</option>
+              <option value="SOL/USDT">SOL/USDT (Solana)</option>
+              <option value="BNB/USDT">BNB/USDT (BNB)</option>
+              <option value="XRP/USDT">XRP/USDT (XRP)</option>
+              <option value="DOGE/USDT">DOGE/USDT (Dogecoin)</option>
+              <option value="SUI/USDT">SUI/USDT (Sui)</option>
+              <option value="PEPE/USDT">PEPE/USDT (Pepe)</option>
+              <option value="AVAX/USDT">AVAX/USDT (Avalanche)</option>
+              <option value="LINK/USDT">LINK/USDT (Chainlink)</option>
+            </select>
           </div>
         </div>
 

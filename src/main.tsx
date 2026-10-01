@@ -4,14 +4,16 @@ import App from './App.tsx';
 import './index.css';
 
 // Guard against cross-origin iframe parent/location property access errors
-// in sandbox/preview iframe environments
+// and window.fetch getter-only property assignments in preview environments
 if (typeof window !== 'undefined') {
   window.addEventListener('error', (event) => {
+    const msg = event.message || (event.error?.message || '');
     if (
-      event.message &&
-      (event.message.includes("Blocked a frame with origin") ||
-       event.message.includes("cross-origin frame") ||
-       event.message.includes("'origin' from 'Location'"))
+      msg.includes("Blocked a frame with origin") ||
+      msg.includes("cross-origin frame") ||
+      msg.includes("Cannot set property fetch") ||
+      msg.includes("fetch of #<Window>") ||
+      msg.includes("'origin' from 'Location'")
     ) {
       event.stopImmediatePropagation();
       event.preventDefault();
@@ -25,6 +27,8 @@ if (typeof window !== 'undefined') {
     if (
       msg.includes("Blocked a frame with origin") ||
       msg.includes("cross-origin frame") ||
+      msg.includes("Cannot set property fetch") ||
+      msg.includes("fetch of #<Window>") ||
       msg.includes("'origin' from 'Location'")
     ) {
       event.stopImmediatePropagation();

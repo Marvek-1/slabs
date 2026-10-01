@@ -17,11 +17,15 @@ import {
   createInitialSimulationState,
   generateSyntheticOrderBook,
   PAIR_CONFIGS,
+  fetchRealBinancePrices,
+  fetchRealBinanceDepthSnapshot,
+  normalizeFuturesSymbol,
 } from './engine/simulationCore';
 import {
   computeAirPocketUsd,
   calculateCvi,
   calculateExhaustionEntry,
+  fetchRealBinanceMarketMetrics,
 } from './engine/physicsEngine';
 import { MachineState, ActivePosition, HammerType, TradeHistoryItem } from './types';
 
@@ -42,6 +46,62 @@ export default function App() {
     'Resting bids scanned. Air pocket calculation active.',
   ]);
 
+  // Fetch real live Binance market prices, Open Interest, and L2 Depth Snapshot
+  const refreshPairLiveMetrics = useCallback(async (pair: string) => {
+    const config = PAIR_CONFIGS[pair] || PAIR_CONFIGS['BTC/USDT'];
+    const [priceMap, metricsData, depthSnapshot] = await Promise.all([
+      fetchRealBinancePrices(),
+      fetchRealBinanceMarketMetrics(config.symbol, '5m').catch(() => null),
+      fetchRealBinanceDepthSnapshot(config.symbol),
+    ]);
+
+    if (metricsData) {
+      const oiUsd = metricsData.openInterestQuoteNotional;
+      const oiDeltaStr = metricsData.oiDeltaPercent !== null ? `${metricsData.oiDeltaPercent >= 0 ? '+' : ''}${metricsData.oiDeltaPercent.toFixed(2)}% (5m)` : 'N/A';
+      addLog(`📊 Live Binance OI loaded for ${config.symbol}: $${(oiUsd / 1000000).toFixed(1)}M | 5m OI Delta: ${oiDeltaStr} | Funding: ${(metricsData.lastFundingRate * 100).toFixed(4)}%`);
+
+      setSimState((prev) => {
+        const activeOrderbook = depthSnapshot || prev.orderbook;
+        const currentClusterPrice = prev.cluster.price || metricsData.markPrice * 0.976;
+        const currentClusterUsd = prev.cluster.volumeUsd || 15000000;
+
+        const { airPocketDepthUsd, levelsCount } = computeAirPocketUsd(
+          activeOrderbook.bids,
+          activeOrderbook.currentPrice > 0 ? activeOrderbook.currentPrice : metricsData.markPrice,
+          currentClusterPrice
+        );
+        const cvi = calculateCvi(currentClusterUsd, airPocketDepthUsd);
+        const { exhaustionPrice } = calculateExhaustionEntry(
+          activeOrderbook.bids,
+          currentClusterPrice,
+          currentClusterUsd * 1.2
+        );
+
+        return {
+          ...prev,
+          orderbook: activeOrderbook,
+          metrics: {
+            ...prev.metrics,
+            openInterest: oiUsd,
+            fundingRate: metricsData.lastFundingRate,
+            oiDeltaPercent: metricsData.oiDeltaPercent ?? 0,
+            airPocketDepthUsd,
+            cvi,
+            exhaustionPrice,
+            restingBidsCount: levelsCount,
+          },
+        };
+      });
+    } else if (config && priceMap[config.symbol]) {
+      const livePrice = priceMap[config.symbol];
+      addLog(`⚡ Live Binance price loaded for ${config.symbol}: $${livePrice.toLocaleString()}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshPairLiveMetrics(currentPair);
+  }, [currentPair, refreshPairLiveMetrics]);
+
   const addLog = useCallback((msg: string) => {
     const timestamp = new Date().toISOString().substring(11, 23);
     setLogs((prev) => [...prev.slice(-40), `[${timestamp}] ${msg}`]);
@@ -53,6 +113,7 @@ export default function App() {
     const fresh = createInitialSimulationState(newPair);
     setSimState(fresh);
     addLog(`Switched target symbol to ${newPair}. Recalibrating cluster invariants.`);
+    refreshPairLiveMetrics(newPair);
   };
 
   // State Machine: 90-second chronometer loop
@@ -317,59 +378,98 @@ export default function App() {
     addLog('🔄 State machine reset. Local orderbook and air pocket physics recalibrated to IDLE.');
   };
 
-  // Live WebSocket Toggle
-  const handleToggleLiveFeed = () => {
+  const wsRef = useRef<WebSocket | null>(null);
+  const tradeTimestampsRef = useRef<number[]>([]);
+
+  // Live Binance USD-M Futures WebSocket Connection (Ticks & L2 Depth)
+  useEffect(() => {
     if (!simState.isLiveFeed) {
-      addLog('Connecting to Binance Public WebSocket feed (depth20@100ms)...');
-      setSimState((prev) => ({ ...prev, isLiveFeed: true }));
-      // Attempt live connection
-      try {
-        const symbol = PAIR_CONFIGS[currentPair]?.symbol.toLowerCase() || 'btcusdt';
-        const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${symbol}@depth20@100ms`);
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      return;
+    }
 
-        ws.onopen = () => {
-          addLog(`🟢 Binance WebSocket live connected for ${symbol.toUpperCase()}. Real-time L2 delta active.`);
-        };
+    const config = PAIR_CONFIGS[currentPair] || PAIR_CONFIGS['BTC/USDT'];
+    const symbol = normalizeFuturesSymbol(config.symbol).toLowerCase();
+    const wsUrl = `wss://fstream.binance.com/stream?streams=${symbol}@depth20@100ms/${symbol}@aggTrade`;
 
-        ws.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            if (data.bids && data.asks) {
-              const bids = data.bids.map((b: string[]) => ({
-                price: parseFloat(b[0]),
-                size: parseFloat(b[1]),
-                totalUsd: parseFloat(b[0]) * parseFloat(b[1]),
-                cumulativeUsd: 0,
-              }));
-              const asks = data.asks.map((a: string[]) => ({
-                price: parseFloat(a[0]),
-                size: parseFloat(a[1]),
-                totalUsd: parseFloat(a[0]) * parseFloat(a[1]),
-                cumulativeUsd: 0,
-              }));
+    addLog(`Connecting to Binance USD-M Futures live stream for ${symbol.toUpperCase()}...`);
 
-              // Accumulate USD
-              let cumBids = 0;
-              bids.forEach((b: any) => {
-                cumBids += b.totalUsd;
-                b.cumulativeUsd = cumBids;
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        addLog(`🟢 BINANCE FUTURES WS CONNECTED: Live 100ms L2 depth & real-time trade ticks active for ${symbol.toUpperCase()}.`);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          const stream = payload.stream || '';
+          const data = payload.data || {};
+
+          if (stream.includes('depth20')) {
+            const rawBids: Array<[string, string]> = data.b || [];
+            const rawAsks: Array<[string, string]> = data.a || [];
+
+            if (rawBids.length > 0 && rawAsks.length > 0) {
+              const bids = rawBids.map((b) => {
+                const p = parseFloat(b[0]);
+                const s = parseFloat(b[1]);
+                return {
+                  price: p,
+                  size: s,
+                  totalUsd: p * s,
+                  cumulativeUsd: 0,
+                };
               });
 
-              let cumAsks = 0;
-              asks.forEach((a: any) => {
-                cumAsks += a.totalUsd;
-                a.cumulativeUsd = cumAsks;
+              const asks = rawAsks.map((a) => {
+                const p = parseFloat(a[0]);
+                const s = parseFloat(a[1]);
+                return {
+                  price: p,
+                  size: s,
+                  totalUsd: p * s,
+                  cumulativeUsd: 0,
+                };
               });
 
-              const mid = bids.length > 0 && asks.length > 0 ? (bids[0].price + asks[0].price) / 2 : bids[0]?.price || 64000;
+              let cumB = 0;
+              bids.forEach((b) => {
+                cumB += b.totalUsd;
+                b.cumulativeUsd = cumB;
+              });
 
-              setSimState((p) => {
-                const { airPocketDepthUsd } = computeAirPocketUsd(bids, mid, p.cluster.price);
-                const cvi = calculateCvi(p.cluster.volumeUsd, airPocketDepthUsd);
-                const { exhaustionPrice } = calculateExhaustionEntry(bids, p.cluster.price, p.cluster.volumeUsd);
+              let cumA = 0;
+              asks.forEach((a) => {
+                cumA += a.totalUsd;
+                a.cumulativeUsd = cumA;
+              });
+
+              const mid = (bids[0].price + asks[0].price) / 2;
+
+              setSimState((prev) => {
+                const { airPocketDepthUsd, levelsCount } = computeAirPocketUsd(
+                  bids,
+                  mid,
+                  prev.cluster.price
+                );
+                const cvi = calculateCvi(prev.cluster.volumeUsd, airPocketDepthUsd);
+                const { exhaustionPrice } = calculateExhaustionEntry(
+                  bids,
+                  prev.cluster.price,
+                  prev.cluster.volumeUsd,
+                  3.0,
+                  1.2
+                );
 
                 return {
-                  ...p,
+                  ...prev,
                   orderbook: {
                     bids,
                     asks,
@@ -378,27 +478,60 @@ export default function App() {
                     timestamp: Date.now(),
                   },
                   metrics: {
-                    ...p.metrics,
+                    ...prev.metrics,
                     airPocketDepthUsd,
                     cvi,
                     exhaustionPrice,
+                    restingBidsCount: levelsCount,
                   },
                 };
               });
             }
-          } catch (e) {
-            // silent parse error
-          }
-        };
+          } else if (stream.includes('aggTrade')) {
+            // Rolling tick velocity calculation from live trades
+            const now = Date.now();
+            tradeTimestampsRef.current.push(now);
+            const oneSecAgo = now - 1000;
+            while (tradeTimestampsRef.current.length > 0 && tradeTimestampsRef.current[0] < oneSecAgo) {
+              tradeTimestampsRef.current.shift();
+            }
+            const liveVelocity = tradeTimestampsRef.current.length;
 
-        ws.onerror = () => {
-          addLog('Binance WebSocket unreachable or rate-limited. Falling back smoothly to synthetic high-fidelity engine.');
-          setSimState((prev) => ({ ...prev, isLiveFeed: false }));
-        };
-      } catch (err) {
-        addLog('WebSocket initialization error. Using synthetic physics mode.');
+            setSimState((prev) => ({
+              ...prev,
+              metrics: {
+                ...prev.metrics,
+                tickVelocity: Math.max(liveVelocity * 2.5, 16),
+              },
+            }));
+          }
+        } catch {
+          // ignore parsing frame
+        }
+      };
+
+      ws.onerror = () => {
+        addLog(`⚠️ Binance WebSocket stream error for ${symbol.toUpperCase()}. Falling back to physics simulator.`);
         setSimState((prev) => ({ ...prev, isLiveFeed: false }));
+      };
+    } catch {
+      addLog('Failed to establish WebSocket connection. Using physics sandbox.');
+      setSimState((prev) => ({ ...prev, isLiveFeed: false }));
+    }
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
       }
+    };
+  }, [simState.isLiveFeed, currentPair, addLog]);
+
+  // Live WebSocket Toggle
+  const handleToggleLiveFeed = () => {
+    if (!simState.isLiveFeed) {
+      addLog('Connecting to Binance USD-M Futures WebSocket (depth20@100ms & aggTrade)...');
+      setSimState((prev) => ({ ...prev, isLiveFeed: true }));
     } else {
       addLog('Switched from Live Feed to Physics Simulation Sandbox.');
       setSimState((prev) => ({ ...prev, isLiveFeed: false }));

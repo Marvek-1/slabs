@@ -115,7 +115,8 @@ class MultiPairFleetShadowTrader:
                 writer = csv.writer(f)
                 writer.writerow([
                     "Timestamp", "Symbol", "Entry_Price", "Exit_Price", 
-                    "CVI_Entry", "Queue_Clearance_Sec", "Hold_Seconds", "Outcome", "PnL_Pct", "PnL_USD"
+                    "CVI_Entry", "Queue_Clearance_Sec", "Hold_Seconds", "Outcome", 
+                    "PnL_Pct", "Gross_PnL_USD", "Fee_USD", "Net_PnL_USD", "Net_PnL_Pct"
                 ])
 
     def emergency_halt_all(self):
@@ -134,14 +135,23 @@ class MultiPairFleetShadowTrader:
 
         hold_time = round(time.time() - pos["fill_time"], 2)
         entry_price = pos["entry_price"]
-        pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-        pnl_usd = (pnl_pct / 100) * MARGIN_PER_SLOT_USD * 10 # 10x effective leverage
+        position_notional = MARGIN_PER_SLOT_USD * 10  # 10x leverage
+        gross_pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+        gross_pnl_usd = (gross_pnl_pct / 100) * position_notional
         
+        # 0.07% round-trip exchange fee (0.02% maker post-only entry + 0.05% market taker exit)
+        fee_pct = 0.07
+        fee_usd = (fee_pct / 100) * position_notional
+        net_pnl_usd = gross_pnl_usd - fee_usd
+        net_pnl_pct = gross_pnl_pct - fee_pct
+
         print("\n" + "="*65)
-        print(f"📊 [FLEET POSITION CLOSED] Symbol: {symbol.upper()} | Outcome: {outcome}")
-        print(f"   Entry: ${entry_price:,.4f} -> Exit: ${exit_price:,.4f}")
+        print(f"📊 [EXECUTABLE POSITION CLOSED] Symbol: {symbol.upper()} | Outcome: {outcome}")
+        print(f"   Entry (Ask + Slippage): ${entry_price:,.4f} -> Exit (Bid - Slippage): ${exit_price:,.4f}")
         print(f"   Hold: {hold_time}s / {MAX_HOLD_SECONDS}s | Queue Clearance: {pos['queue_clearance_sec']}s")
-        print(f"   PnL: {pnl_pct:+.2f}% (${pnl_usd:+.2f}) | Open Slots: {len(self.active_slots)}/{MAX_ACTIVE_SLOTS}")
+        print(f"   Gross PnL: {gross_pnl_pct:+.2f}% (${gross_pnl_usd:+.2f})")
+        print(f"   Fee Drag (0.07%): -${fee_usd:.2f}")
+        print(f"   Net PnL: {net_pnl_pct:+.2f}% (${net_pnl_usd:+.2f}) | Open Slots: {len(self.active_slots)}/{MAX_ACTIVE_SLOTS}")
         print("="*65 + "\n")
 
         with open(CSV_FILE, mode='a', newline='') as f:
@@ -153,20 +163,25 @@ class MultiPairFleetShadowTrader:
                 pos["queue_clearance_sec"],
                 hold_time,
                 outcome,
-                round(pnl_pct, 4),
-                round(pnl_usd, 2)
+                round(gross_pnl_pct, 4),
+                round(gross_pnl_usd, 2),
+                round(fee_usd, 2),
+                round(net_pnl_usd, 2),
+                round(net_pnl_pct, 4)
             ])
 
         # Dispatch exit alert
-        color = "green" if "TP_HIT" in outcome else ("amber" if pnl_pct > 0 else "rose")
+        color = "green" if "TP_HIT" in outcome else ("amber" if net_pnl_usd > 0 else "rose")
         await self.dispatcher.send_alert(
-            title=f"✅ [FLEET POSITION CLOSED] — {symbol.upper()}",
+            title=f"✅ [EXECUTABLE POSITION CLOSED] — {symbol.upper()}",
             details={
                 "Outcome": outcome,
                 "Hold Duration": f"{hold_time}s / {MAX_HOLD_SECONDS}s Max",
-                "Entry Price": f"${entry_price:,.4f}",
-                "Exit Price": f"${exit_price:,.4f}",
-                "Profit Realized": f"{pnl_pct:+.2f}% (${pnl_usd:+.2f})",
+                "Executable Entry": f"${entry_price:,.4f}",
+                "Executable Exit": f"${exit_price:,.4f}",
+                "Gross PnL": f"{gross_pnl_pct:+.2f}% (${gross_pnl_usd:+.2f})",
+                "Fee Drag (-0.07%)": f"-${fee_usd:.2f}",
+                "Net Realized PnL": f"{net_pnl_pct:+.2f}% (${net_pnl_usd:+.2f})",
                 "Slots Remaining": f"{len(self.active_slots)}/{MAX_ACTIVE_SLOTS} Active"
             },
             color=color
@@ -260,7 +275,11 @@ class MultiPairFleetShadowTrader:
             state["timestamps"].popleft()
         state["velocity"] = len(state["timestamps"])
 
-        # Check armed trap -> FIFO queue fill authentication
+        best_bid = state["bids"][0][0] if state["bids"] else price
+        best_ask = state["asks"][0][0] if state["asks"] else price
+        modeled_slippage = (best_ask - best_bid) * 0.5 if (best_ask > best_bid) else price * 0.0001
+
+        # Check armed trap -> FIFO queue fill authentication against executable ask
         if symbol in self.armed_traps:
             trap = self.armed_traps[symbol]
             if price <= trap["entry_price"]:
@@ -269,15 +288,17 @@ class MultiPairFleetShadowTrader:
                 if trap["accumulated_fill_usd"] >= REQUIRED_QUEUE_USD:
                     if len(self.active_slots) < MAX_ACTIVE_SLOTS:
                         clearance_sec = round(now - trap["armed_time"], 2)
+                        executable_entry = max(best_ask, trap["entry_price"]) + modeled_slippage
                         self.active_slots[symbol] = {
-                            "entry_price": trap["entry_price"],
-                            "target_tp": trap["target_tp"],
+                            "entry_price": executable_entry,
+                            "target_tp": executable_entry * (1 + SNAPBACK_TP_PCT),
                             "fill_time": now,
                             "cvi": trap["cvi"],
                             "queue_clearance_sec": clearance_sec,
                         }
                         del self.armed_traps[symbol]
                         print(f"\n⚡ [SLOT ALLOCATED] {symbol.upper()} FILLED after ${trap['accumulated_fill_usd']:,.0f} queue selloff ({clearance_sec}s)")
+                        print(f"   Executable Entry: ${executable_entry:,.4f} | Target TP: ${self.active_slots[symbol]['target_tp']:,.4f}")
                         print(f"   Active Slots: {len(self.active_slots)}/{MAX_ACTIVE_SLOTS} | Margin Allocated: ${MARGIN_PER_SLOT_USD:,.0f}")
 
                         # Dispatch Detonation Alert
@@ -286,8 +307,8 @@ class MultiPairFleetShadowTrader:
                             details={
                                 "Vacuum Metric": f"CVI {trap['cvi']:.2f}x (Thin Book)",
                                 "Queue Hurdle": f"${REQUIRED_QUEUE_USD:,.0f} Absorbed ({clearance_sec}s)",
-                                "Net Entry": f"${trap['entry_price']:,.4f} (Post-Only Filled)",
-                                "Target TP": f"${trap['target_tp']:,.4f} (+0.50% Snapback)",
+                                "Executable Entry": f"${executable_entry:,.4f} (Post-Only + Slippage)",
+                                "Target TP": f"${self.active_slots[symbol]['target_tp']:,.4f} (+0.50% Snapback)",
                                 "Chronometer": f"{MAX_HOLD_SECONDS}s Mechanical Countdown",
                                 "Active Slots": f"{len(self.active_slots)}/{MAX_ACTIVE_SLOTS} ({OPERATIONAL_MODE} Mode)"
                             },
@@ -296,15 +317,17 @@ class MultiPairFleetShadowTrader:
                     else:
                         print(f"⚠️ [SLOT CONGESTION] {symbol.upper()} penetrated queue but all {MAX_ACTIVE_SLOTS} slots occupied. Queuing.")
 
-        # Check active position management
+        # Check active position management against live executable bid
         elif symbol in self.active_slots:
             pos = self.active_slots[symbol]
             elapsed = now - pos["fill_time"]
+            executable_exit = max(0.0001, best_bid - modeled_slippage)
 
-            if price >= pos["target_tp"]:
+            # Executable exit requires live best_bid stream to cross target_tp
+            if best_bid >= pos["target_tp"]:
                 await self.log_trade(symbol, pos["target_tp"], "TP_HIT (Mean Reversion)")
             elif elapsed >= MAX_HOLD_SECONDS:
-                await self.log_trade(symbol, price, "TIME_STOP_EXPIRED (Floor Broken)")
+                await self.log_trade(symbol, executable_exit, "TIME_STOP_EXPIRED (Floor Broken)")
 
     async def run(self):
         streams = []

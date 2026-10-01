@@ -9,6 +9,12 @@ import {
   HammerStressState,
 } from '../types';
 import { computeAirPocketUsd, calculateCvi, calculateExhaustionEntry } from './physicsEngine';
+import {
+  PAIRS,
+  fetchRealBinancePrices as fetchRealPricesEngine,
+  fetchRealBinanceDepthSnapshot as fetchRealDepthEngine,
+  normalizeFuturesSymbol,
+} from './marketDataEngine';
 
 export interface MarketPairConfig {
   symbol: string;
@@ -19,32 +25,25 @@ export interface MarketPairConfig {
   stepPct: number;
 }
 
+// Pair configs dynamically updated from live Binance ticker feeds
 export const PAIR_CONFIGS: Record<string, MarketPairConfig> = {
-  'BTC/USDT': {
-    symbol: 'BTCUSDT',
-    name: 'Bitcoin / Tether USD',
-    basePrice: 64280.0,
-    tickSize: 0.5,
-    typicalClusterUsd: 42000000, // $42M cluster
-    stepPct: 0.0015,
-  },
-  'ETH/USDT': {
-    symbol: 'ETHUSDT',
-    name: 'Ethereum / Tether USD',
-    basePrice: 3450.0,
-    tickSize: 0.05,
-    typicalClusterUsd: 18500000, // $18.5M cluster
-    stepPct: 0.002,
-  },
-  'SOL/USDT': {
-    symbol: 'SOLUSDT',
-    name: 'Solana / Tether USD',
-    basePrice: 152.4,
-    tickSize: 0.01,
-    typicalClusterUsd: 8200000, // $8.2M cluster
-    stepPct: 0.0025,
-  },
+  'BTC/USDT': { symbol: 'BTCUSDT', name: 'Bitcoin / Tether USD', basePrice: 0, tickSize: 0.5, typicalClusterUsd: 42000000, stepPct: 0.0015 },
+  'ETH/USDT': { symbol: 'ETHUSDT', name: 'Ethereum / Tether USD', basePrice: 0, tickSize: 0.05, typicalClusterUsd: 18500000, stepPct: 0.002 },
+  'SOL/USDT': { symbol: 'SOLUSDT', name: 'Solana / Tether USD', basePrice: 0, tickSize: 0.01, typicalClusterUsd: 8200000, stepPct: 0.0025 },
+  'BNB/USDT': { symbol: 'BNBUSDT', name: 'BNB / Tether USD', basePrice: 0, tickSize: 0.1, typicalClusterUsd: 5400000, stepPct: 0.002 },
+  'XRP/USDT': { symbol: 'XRPUSDT', name: 'XRP / Tether USD', basePrice: 0, tickSize: 0.0001, typicalClusterUsd: 6100000, stepPct: 0.003 },
+  'DOGE/USDT': { symbol: 'DOGEUSDT', name: 'Dogecoin / Tether USD', basePrice: 0, tickSize: 0.0001, typicalClusterUsd: 7800000, stepPct: 0.0035 },
+  'SUI/USDT': { symbol: 'SUIUSDT', name: 'Sui / Tether USD', basePrice: 0, tickSize: 0.001, typicalClusterUsd: 4900000, stepPct: 0.003 },
+  'PEPE/USDT': { symbol: '1000PEPEUSDT', name: '1000PEPE / Tether USD', basePrice: 0, tickSize: 0.00001, typicalClusterUsd: 5200000, stepPct: 0.004 },
+  'AVAX/USDT': { symbol: 'AVAXUSDT', name: 'Avalanche / Tether USD', basePrice: 0, tickSize: 0.01, typicalClusterUsd: 3800000, stepPct: 0.0025 },
+  'LINK/USDT': { symbol: 'LINKUSDT', name: 'Chainlink / Tether USD', basePrice: 0, tickSize: 0.01, typicalClusterUsd: 3200000, stepPct: 0.0025 },
 };
+
+export async function fetchRealBinancePrices(symbols?: readonly string[]) {
+  return fetchRealPricesEngine(symbols);
+}
+
+export { fetchRealBinanceDepthSnapshot, normalizeFuturesSymbol } from './marketDataEngine';
 
 /**
  * Generates an initial synthetic L2 orderbook with configurable air pockets and clusters
@@ -123,12 +122,27 @@ export function generateSyntheticOrderBook(
   };
 }
 
+
+
 export function createInitialSimulationState(pair: string = 'BTC/USDT') {
   const config = PAIR_CONFIGS[pair] || PAIR_CONFIGS['BTC/USDT'];
-  const clusterPrice = Number((config.basePrice * 0.976).toFixed(2)); // 2.4% below current price
+  const DEFAULT_PRICES: Record<string, number> = {
+    'BTC/USDT': 83810,
+    'ETH/USDT': 3120,
+    'SOL/USDT': 178,
+    'BNB/USDT': 585,
+    'XRP/USDT': 0.58,
+    'DOGE/USDT': 0.14,
+    'SUI/USDT': 1.84,
+    'PEPE/USDT': 0.0094,
+    'AVAX/USDT': 28.3,
+    'LINK/USDT': 11.4,
+  };
+  const activeBasePrice = config.basePrice > 0 ? config.basePrice : (DEFAULT_PRICES[pair] || 100);
+  const clusterPrice = Number((activeBasePrice * 0.976).toFixed(2)); // 2.4% below current price
   const clusterUsd = config.typicalClusterUsd;
 
-  const orderbook = generateSyntheticOrderBook(config.basePrice, clusterPrice, clusterUsd, 0.22, false);
+  const orderbook = generateSyntheticOrderBook(activeBasePrice, clusterPrice, clusterUsd, 0.22, false);
 
   const { airPocketDepthUsd, levelsCount } = computeAirPocketUsd(orderbook.bids, orderbook.currentPrice, clusterPrice);
   const cvi = calculateCvi(clusterUsd, airPocketDepthUsd);
@@ -186,7 +200,7 @@ export function createInitialSimulationState(pair: string = 'BTC/USDT') {
     activePosition: null as ActivePosition | null,
     tradeHistory: [] as TradeHistoryItem[],
     hammer: initialHammer,
-    isLiveFeed: false,
+    isLiveFeed: true, // Default to Live Real Binance WebSocket Feed
     snapbackHoldSeconds: 0,
     portfolioEquity: 250000, // $250k trading desk initial capital
     fractionalKellyPct: 1.8, // 1.8% allocation
